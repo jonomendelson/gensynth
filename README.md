@@ -1,5 +1,9 @@
 # GenSynth: Genetic Algorithm Datalog Program Synthesis
 
+### Demo
+
+Please try out our (resource limited) demo at http://gensynth.cis.upenn.edu/, or run GenSynth yourself by following the instructions below.
+
 ### Prerequisites
 
 1. Python 3
