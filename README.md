@@ -1,4 +1,4 @@
-# GenSynth: Genetic Algorithm Datalog Program Synthesis
+# GenSynth: Genetic Datalog Program Synthesis
 
 ### Demo
 
