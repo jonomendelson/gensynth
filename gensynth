@@ -1,0 +1,1385 @@
+#!/usr/bin/env python3
+
+########################################################################################################################
+# Genetic Datalog Synthesis Tool
+# Invocation: ./gensynth PROBLEM_DIR NAME NUM_THREADS LOG_NUM USE_NEG F1_THRESHOLD
+
+# The PROBLEM_DIR folder is expected to contain:
+# 1. rules.t: Specifies the signatures of the EDB and IDB relations in the following format:
+#   *Format(Type, Type) specifies an input relation
+#   Format(Type, Type) specifies an output relation
+# 2. R.facts, for each input relation R other than Rule: Specifies the EDB
+# 3. R.expected, for each output relation R: Specified the expected IDB
+
+# Note that invented predicates should NOT be specified in any way
+
+# If synthesis is successful, then it prints to stdout a valid program with the desired input-output behavior
+
+########################################################################################################################
+
+# Note: no reachability enforced, but parallelized (one population per thread)
+
+### IMPORTS ###
+
+import sys
+import random
+import subprocess
+import json
+import copy
+import math
+import time
+import os
+import shutil
+import multiprocessing
+from cmd_args import cmd_args
+
+### HYPERPARAMETERS ###
+
+VERSION_NUMBER = 102
+
+# NUM_POPULATIONS = int(sys.argv[3])
+NUM_POPULATIONS = cmd_args.num_pops # number of populations. we use first found solution from the parallel populations
+ACCRETION_POPULATION_SIZE = 50 # number of programs. we use first found solution from the parallel programs
+REDUCTION_POPULATION_SIZE = 10 # number of programs. we use first found solution from the parallel programs
+
+# PROGRAM LIMITS: both limit execution of program in different ways -- both not necessary
+GENERATION_LIMIT = 5000 # maximum number of generations tried
+TIMEOUT = 6000
+
+TARGET_SCORE = cmd_args.target_score # float(sys.argv[6])
+OPTIMIZATION_TARGET = TARGET_SCORE
+
+SOUFFLE_PATH = cmd_args.souffle_path
+
+runtime_statistics = {"time_accretion": 0, "time_reduction": 0, "reduction_calls": 0, "reduction_num_loops": 0, "solved_subprocess_id": -1, "solution_total_num_literals": 0, "solution_num_clauses": 0, "solution_max_num_literals": 0, "opt_solution_total_num_literals": 0, "opt_solution_num_clauses": 0, "opt_solution_max_num_literals": 0, "runtime": 0, "fix_ungrounded_args_time": 0, "create_seed_clause_time": 0, "create_linear_clause_time": 0, "create_linear_clause_type_safe_time": 0, "souffle_time": 0, "souffle_calls": 0, "mutating_time": 0, "mutating_num_loops": 0, "generations_to_completion": 0, "total_create_seed_clause_loops": 0, "total_create_linear_clause_type_safe_loops": 0, "total_create_linear_clause_loops": 0, "total_create_seed_clause_calls": 0, "total_create_linear_clause_calls": 0, "total_create_linear_clause_type_safe_calls": 0, "mutating_calls": 0, "solved": 0}
+
+### HELPER FUNCTIONS ###
+
+used_ids = set()
+def get_new_id():
+	new_id = random.randint(111111, 999999)
+	while new_id in used_ids:
+		new_id = random.randint(111111, 999999)
+	return str(new_id)
+
+def fScore(tp, fp, fn, beta): #(tp, why, why_not)
+	precision = 0
+	recall = 0
+	if (tp + fp) != 0:
+		precision = tp / float(tp + fp)
+	if (tp + fn) != 0:
+		recall = tp / float(tp + fn)
+	denominator = pow(beta, 2) * float(precision) + float(recall)
+	if denominator == 0:
+		return 0
+	return ((1 + pow(beta, 2)) * precision * recall) / denominator
+
+def loadRelation(filename):
+	ans = { line.strip() for line in open(filename) if line.strip() }
+	ans = { tuple(line.split('\t')) for line in ans }
+	return ans
+
+### CLASS DEFINITIONS ###
+class Relation:
+	def __init__(self, name, relation_type, arg_types):
+		self.name = name
+		self.relation_type = relation_type
+		self.arg_types = arg_types
+
+class Literal: # essentially an instance of a Relation
+	def __init__(self, relation, args):
+		self.relation = relation
+		self.args = args
+		self.id = "L" + get_new_id()
+
+	def __str__(self):
+		output_str = self.relation.name + "("
+		for arg in self.args:
+			output_str += arg + ", "
+		return output_str[:-2] + ")"
+
+class Clause:
+	def __init__(self, head_literal, body_literals, DNA):
+		self.head_literal = head_literal
+		self.body_literals = body_literals
+		self.id = "C" + get_new_id()
+		self.DNA = DNA
+
+	def __str__(self):
+		output_str = str(self.head_literal) + " :- "
+		for body_literal in self.body_literals:
+			output_str += str(body_literal) + ", "
+		return output_str[:-2] + "."
+
+	def datalog_str(self):
+		output_str = str(self.head_literal) + " :- "
+		for body_literal in self.body_literals:
+			output_str += str(body_literal) + ", "
+		return output_str[:-2] + ", Rule(" + self.id[1:] + ")."
+
+	def create_seed_clause(self, input_relations): # no inv preds, no recursion, but might need args in body that are not in head and might append more literals than LITERALS_PER_SEED_PROGRAM
+		create_seed_clause_start_time = time.time()
+		runtime_statistics["total_create_seed_clause_calls"] += 1
+		self.body_literals = list()
+
+		needed_arg_count = dict()
+		for arg_type in self.head_literal.relation.arg_types:
+			if not arg_type in needed_arg_count:
+				needed_arg_count[arg_type] = 1
+			else:
+				needed_arg_count[arg_type] += 1
+
+		# build body relations
+		while True:
+			runtime_statistics["total_create_seed_clause_loops"] += 1
+
+			max_reduction = 0
+			max_reduction_relation = None
+			max_reduction_count = dict()
+			input_relations_copy = copy.deepcopy(input_relations)
+			random.shuffle(input_relations_copy)
+			for input_relation in input_relations_copy:
+				current_reduction = 0
+
+				current_arg_count = dict()
+				for arg_type in self.head_literal.relation.arg_types:
+					current_arg_count[arg_type] = 0
+
+				for arg_type in input_relation.arg_types:
+					if not arg_type in current_arg_count:
+						current_arg_count[arg_type] = 1
+					else:
+						current_arg_count[arg_type] += 1
+
+				for arg_type in needed_arg_count:
+					current_reduction += min(current_arg_count[arg_type], needed_arg_count[arg_type])
+
+				if current_reduction > max_reduction:
+					max_reduction = current_reduction
+					max_reduction_relation = input_relation
+					max_reduction_count = current_arg_count
+			if max_reduction == 0:
+				break
+			else:
+				for arg_type in needed_arg_count:
+					needed_arg_count[arg_type] -= min(needed_arg_count[arg_type], max_reduction_count[arg_type])
+				body_literal_args = list()
+				for k in range(0, len(max_reduction_relation.arg_types)):
+					body_literal_args.append("x" + str(random.randint(0, len(max_reduction_relation.arg_types) - 1)))
+				self.body_literals.append(Literal(max_reduction_relation, body_literal_args))
+
+		for j in range(0, int(self.DNA["LITERALS_PER_SEED_PROGRAM"]) - len(self.body_literals)):
+			body_relation = input_relations[random.randint(0, len(input_relations)-1)]
+			body_literal_args = list()
+			for k in range(0, len(body_relation.arg_types)):
+				body_literal_args.append("x") # placeholder
+			self.body_literals.append(Literal(body_relation, body_literal_args))
+		
+		# fill in args
+		arg_choices = dict() #arg choices from head by type
+		for idx, arg_type in enumerate(self.head_literal.relation.arg_types):
+			if not arg_type in arg_choices:
+				arg_choices[arg_type] = list()
+			arg_choices[arg_type].append("x" + str(idx))
+
+		highest_unseen = len(self.head_literal.relation.arg_types)
+		for body_literal in self.body_literals:
+			linked_idx = random.randint(0, len(body_literal.relation.arg_types)-1)
+			for idx, arg_type in enumerate(body_literal.relation.arg_types):
+				if not arg_type in arg_choices:
+					arg_choices[arg_type] = list()
+					arg_choices[arg_type].append("x" + str(highest_unseen))
+					body_literal.args[idx] = "x" + str(highest_unseen)
+					highest_unseen += 1
+				else:
+					if (idx == linked_idx) or random.random() < 0.5:
+						body_literal.args[idx] = arg_choices[arg_type][random.randint(0, len(arg_choices[arg_type]) - 1)]
+					else:
+						body_literal.args[idx] = "x" + str(highest_unseen)
+						highest_unseen += 1
+
+		assert self.is_type_valid()
+		self.fix_ungrounded_args()
+
+		assert len(self.ungrounded_args()) == 0
+		assert self.is_type_valid()
+
+		runtime_statistics["create_seed_clause_time"] += time.time() - create_seed_clause_start_time
+
+
+	def ready_to_be_grounded(self): #contains sufficient clauses that it is possible, by changing arguments, to ground the head literal
+		total_body_args = 0
+		for body_literal in self.body_literals:
+				total_body_args += len(body_literal.args)
+		if len(self.head_literal.args) > total_body_args:
+			return False
+		spot_choices = dict() #spot choices in body by type
+		for i, body_literal in enumerate(self.body_literals):
+			for j, arg_type in enumerate(body_literal.relation.arg_types):
+				if not arg_type in spot_choices:
+					spot_choices[arg_type] = list()
+				spot_choices[arg_type].append((i, j))
+		for ua in self.ungrounded_args():
+			needed_type = self.head_literal.relation.arg_types[int(ua)]
+			if not needed_type in spot_choices:
+				assert len(self.ungrounded_args()) != 0
+				return False
+		return True
+
+	def fix_ungrounded_args(self): #maintains type validity assuming input is type valid 
+		fix_ungrounded_args_start_time = time.time()
+
+		assert self.is_type_valid()
+		assert self.ready_to_be_grounded()
+		total_body_args = 0
+		for body_literal in self.body_literals:
+				total_body_args += len(body_literal.args)
+		while len(self.head_literal.args) > total_body_args:
+			body_relation = input_relations[random.randint(0, len(input_relations)-1)]
+			body_literal_args = list()
+			for k in range(0, len(body_relation.arg_types)):
+				body_literal_args.append("x" + str(random.randint(0, len(body_relation.arg_types) - 1)))
+			self.body_literals.append(Literal(body_relation, body_literal_args))
+			total_body_args = 0
+			for body_literal in self.body_literals:
+				total_body_args += len(body_literal.args)
+
+		spot_choices = dict() #spot choices in body by type
+		for i, body_literal in enumerate(self.body_literals):
+			for j, arg_type in enumerate(body_literal.relation.arg_types):
+				if not arg_type in spot_choices:
+					spot_choices[arg_type] = list()
+				spot_choices[arg_type].append((i, j))
+
+		while len(self.ungrounded_args()) != 0:
+			for ua in self.ungrounded_args():
+				needed_type = self.head_literal.relation.arg_types[int(ua)]
+				if not needed_type in spot_choices:
+					assert False
+				(i, j) = spot_choices[needed_type][random.randint(0, len(spot_choices[needed_type]) - 1)]
+				self.body_literals[i].args[j] = "x" + ua
+		assert self.is_type_valid()
+
+		runtime_statistics["fix_ungrounded_args_time"] += time.time() - fix_ungrounded_args_start_time
+
+	def ungrounded_args(self):
+		arg_count = dict()
+		head_args = set()
+		for arg in self.head_literal.args:
+			head_args.add(arg[1:])
+		for body_literal in self.body_literals:
+			for arg in body_literal.args:
+				if not arg[1:] in arg_count:
+					arg_count[arg[1:]] = 1
+				else:
+					arg_count[arg[1:]] += 1
+		ungrounded_args_list = list()
+		for arg_id in head_args:
+			if not arg_id in arg_count:
+				ungrounded_args_list.append(arg_id)
+		return ungrounded_args_list
+
+	def max_arg_id(self):
+		max_seen_arg_id = len(self.head_literal.relation.arg_types) - 1
+		for body_literal in self.body_literals:
+			for arg in body_literal.args:
+				max_seen_arg_id = max(max_seen_arg_id, int(arg[1:]))
+		return max_seen_arg_id
+
+	def is_type_valid(self):
+		argument_types = dict()
+		for literal in ([self.head_literal] + self.body_literals):
+			for idx, arg in enumerate(literal.args):
+				arg_type = literal.relation.arg_types[idx]
+				if not arg in argument_types:
+					argument_types[arg] = arg_type
+				else:
+					if argument_types[arg] != arg_type:
+						return False
+		return True
+
+class Program:
+	def __init__(self, input_relations, output_relation, DNA):
+		self.input_relations = input_relations # all input relations that the program can use
+		self.head_relations = [output_relation] # all relations that could be the head of a clause
+		self.output_relation = output_relation # relation which we are trying to learn (we have output data for it)
+
+		self.inv_pred_num = 0
+
+		self.clauses = dict()
+		self.id = "P" + get_new_id()
+		
+		self.num_correct = 0
+		self.num_undesired_but_produced = 0
+		self.num_desired_but_unproduced = 0
+		self.fitness = 0
+		self.f1 = 0
+		self.size = 1000000
+
+		self.DNA = DNA
+
+		self.mutation_log = list()
+
+		self.available_reductions = ["rr", "ri", "mc", "ml", "ma"]
+		self.subprocess_id = -1
+
+	def __str__(self):
+		output_str = "PROGRAM " + str(self.id) + "\n"
+		output_str += "DNA: " + str(self.DNA) + "\n"
+		for clause in self.clauses:
+			output_str += str(self.clauses[clause]) + "\n"
+		output_str += "\n"
+		return output_str
+
+	def datalog_program(self):
+		output_str = ""
+		for type_signature in type_signatures:
+			output_str += ".type " + type_signature + "\n"
+		output_str += "\n.decl Rule(v0: number)\n.input Rule\n"
+		for input_relation in self.input_relations:
+			output_str += "\n"
+			output_str += ".decl " + input_relation.name + "("
+			for idx, arg_type in enumerate(input_relation.arg_types):
+				output_str += "v" + str(idx) + ": " + arg_type + ", "
+			output_str = output_str[:-2] + ")\n"
+			output_str += ".input " + input_relation.name + "\n"
+		for output_relation in self.head_relations:
+			output_str += "\n"
+			output_str += ".decl " + output_relation.name + "("
+			for idx, arg_type in enumerate(output_relation.arg_types):
+				output_str += "v" + str(idx) + ": " + arg_type + ", "
+			output_str = output_str[:-2] + ")\n"
+			output_str += ".output " + output_relation.name + "\n"
+		output_str += "\n"
+		for clause in self.clauses:
+			output_str += self.clauses[clause].datalog_str() + "\n"
+		return output_str
+
+	def datalog_rule_facts(self):
+		output_str = ""
+		for clause in self.clauses:
+			output_str += self.clauses[clause].id[1:] + "\n"
+		return output_str
+	
+	def is_type_valid(self):
+		for clause_id in self.clauses:
+			if not self.clauses[clause_id].is_type_valid():
+				return False
+		return True
+
+	def is_grounded(self):
+		for clause_id in self.clauses:
+			if len(self.clauses[clause_id].ungrounded_args()) != 0:
+				return False
+		return True
+
+	def create_seed_program(self): # seed programs cannot have any arguments not found in the head literal
+		while True: # loop until we have type-valid seed program
+			self.clauses = dict()
+			for i in range(0, int(self.DNA["CLAUSES_PER_SEED_PROGRAM"])):
+				head_literal_args = [("x" + str(arg_id)) for arg_id in range(0, len(self.output_relation.arg_types))]
+				head_literal = Literal(self.output_relation, head_literal_args)
+
+				argument_id_limit = len(self.output_relation.arg_types) - 1
+
+				clause = Clause(head_literal, list(), self.DNA)
+				clause.create_seed_clause(self.input_relations)
+				self.clauses[clause.id] = clause
+
+			if self.is_type_valid():
+				break
+
+	def mutation_append(self): 
+		self.mutation_log.append("APPEND")
+
+		assert self.is_type_valid()
+
+		if random.random() < 0.5: #(self.num_undesired_but_produced < self.num_desired_but_unproduced): # no bad clauses --> WHY < WHY NOT
+			output_relation = self.head_relations[random.randint(0, len(self.head_relations)-1)]
+
+			head_literal_args = [("x" + str(arg_id)) for arg_id in range(0, len(output_relation.arg_types))]
+			head_literal = Literal(output_relation, head_literal_args)
+
+			clause = Clause(head_literal, list(), self.DNA)
+			relation_pool = list(set(self.input_relations + self.head_relations) - set([output_relation]))
+			clause.create_seed_clause(relation_pool)
+			self.clauses[clause.id] = clause
+
+		else:
+			chosen_clause_key = random.choice(list(self.clauses))
+			chosen_clause_key = chosen_clause_key[1:]
+
+			chosen_clause = self.clauses["C" + chosen_clause_key]
+			relation_pool = self.input_relations + self.head_relations
+
+			chosen_relation = relation_pool[random.randint(0, len(relation_pool)-1)]
+
+			arg_choices = dict() #arg choices from head by type
+			for idx, arg_type in enumerate(chosen_clause.head_literal.relation.arg_types):
+				if not arg_type in arg_choices:
+					arg_choices[arg_type] = list()
+				arg_choices[arg_type].append(chosen_clause.head_literal.args[idx])
+			for cur_body_literal in chosen_clause.body_literals:
+				for idx, arg_type in enumerate(cur_body_literal.relation.arg_types):
+					if not arg_type in arg_choices:
+						arg_choices[arg_type] = list()
+					arg_choices[arg_type].append(cur_body_literal.args[idx])
+
+			highest_unseen = chosen_clause.max_arg_id() + 1
+
+			# TODO: fix that sometimes appends unreachable clause (if linked_idx is idx where no arg choice)
+			new_literal_args = list()
+			for idx, arg_type in enumerate(chosen_relation.arg_types):
+				linked_idx = random.randint(0, len(chosen_relation.arg_types)-1)
+				if not arg_type in arg_choices:
+					arg_choices[arg_type] = list()
+					arg_choices[arg_type].append("x" + str(highest_unseen))
+					new_literal_args.append("x" + str(highest_unseen))
+					highest_unseen += 1
+				else:
+					if (idx == linked_idx) or random.random() < 0.5:
+						new_literal_args.append(arg_choices[arg_type][random.randint(0, len(arg_choices[arg_type]) - 1)])
+					else:
+						new_literal_args.append("x" + str(highest_unseen))
+						highest_unseen += 1
+
+			new_literal = Literal(chosen_relation, new_literal_args)
+			chosen_clause.body_literals.append(new_literal)
+
+		assert self.is_type_valid()
+
+	def mutation_extend_clause(self):
+		self.mutation_log.append("EXTEND")
+		assert self.is_type_valid()
+
+		# finds a relation that has two args of the same type and a clause with a literal that has an arg of that type.
+		# if a is the arg in the clause and (b, c) are in the literal, transforms (a, (_, _)) to (x, (x, a))
+
+		# find a relation to extend clause with
+		shuffled_relations = copy.deepcopy(self.input_relations + self.head_relations)
+		random.shuffle(shuffled_relations)
+		for chosen_relation in shuffled_relations:
+			shuffled_relation_args_one = list(enumerate(chosen_relation.arg_types))
+			shuffled_relation_args_two = list(enumerate(chosen_relation.arg_types))
+			random.shuffle(shuffled_relation_args_one)
+			random.shuffle(shuffled_relation_args_two)
+			for arg_idx_one, arg_type_one in shuffled_relation_args_one:
+				for arg_idx_two, arg_type_two in shuffled_relation_args_two:
+					if (arg_idx_one != arg_idx_two) and (arg_type_one == arg_type_two):
+
+						# find a clause to extend
+						clause_ids = list(self.clauses).copy()
+						random.shuffle(clause_ids)
+						
+
+						for clause_id in clause_ids:
+							chosen_clause = self.clauses[clause_id]
+
+							# find a literal to pull an argument from
+							literal_idxs = list(range(0, len(chosen_clause.body_literals)))
+							random.shuffle(literal_idxs)
+							for chosen_literal_idx in literal_idxs:
+								chosen_literal = chosen_clause.body_literals[chosen_literal_idx]
+								
+								# find an argument to pull from the literal
+								replaced_arg_idxs = list()
+								for replaced_arg_idx, replaced_arg_type in enumerate(chosen_literal.relation.arg_types):
+									if replaced_arg_type == arg_type_one:
+										replaced_arg_idxs.append(replaced_arg_idx)
+
+								if len(replaced_arg_idxs) != 0:
+									arg_idx_to_replace = random.choice(replaced_arg_idxs)
+									arg_at_end_of_chain = chosen_literal.args[arg_idx_to_replace]
+
+									# learn arg types
+									arg_choices = dict()
+									for idx, arg_type in enumerate(chosen_clause.head_literal.relation.arg_types):
+										if not arg_type in arg_choices:
+											arg_choices[arg_type] = list()
+										arg_choices[arg_type].append(chosen_clause.head_literal.args[idx])
+									for cur_body_literal in chosen_clause.body_literals:
+										for idx, arg_type in enumerate(cur_body_literal.relation.arg_types):
+											if not arg_type in arg_choices:
+												arg_choices[arg_type] = list()
+											arg_choices[arg_type].append(cur_body_literal.args[idx])
+
+									# perform the extension
+									link_arg = "x" + str(chosen_clause.max_arg_id() + 1)
+									highest_unseen = chosen_clause.max_arg_id() + 2
+
+									new_literal_args = list()
+									for curr_arg_type in chosen_relation.arg_types:
+										if not curr_arg_type in arg_choices:
+											arg_choices[curr_arg_type] = list()
+											arg_choices[curr_arg_type].append("x" + str(highest_unseen))
+											new_literal_args.append("x" + str(highest_unseen))
+											highest_unseen += 1
+										else:
+											if random.random() < 0.5: # doesn't need a forced link since extend already forces a link
+												new_literal_args.append(arg_choices[curr_arg_type][random.randint(0, len(arg_choices[curr_arg_type]) - 1)])
+											else:
+												new_literal_args.append("x" + str(highest_unseen))
+												highest_unseen += 1
+									new_literal_args[arg_idx_one] = link_arg
+									new_literal_args[arg_idx_two] = arg_at_end_of_chain
+									chosen_literal.args[arg_idx_to_replace] = link_arg
+
+									new_literal = Literal(chosen_relation, new_literal_args)
+
+									chosen_clause.body_literals.append(new_literal)
+									
+									assert self.is_type_valid()
+									return True
+
+		assert self.is_type_valid()
+
+
+	def mutation_swap(self):
+		self.mutation_log.append("SWAP")
+		
+		assert self.is_type_valid()
+		clause_ids = list(self.clauses).copy()
+		random.shuffle(clause_ids)
+		for clause_id in clause_ids:
+			chosen_clause = self.clauses[clause_id]
+
+			possible_swaps = list()
+			shuffled_literal_idxs_one = list(range(len(chosen_clause.body_literals)))
+			shuffled_literal_idxs_two = list(range(len(chosen_clause.body_literals)))
+			random.shuffle(shuffled_literal_idxs_one)
+			random.shuffle(shuffled_literal_idxs_two)
+			for literal_idx_one in shuffled_literal_idxs_one:
+				for literal_idx_two in shuffled_literal_idxs_two:
+					shuffled_arg_idxs_one = list(range(len(chosen_clause.body_literals[literal_idx_one].args)))
+					shuffled_arg_idxs_two = list(range(len(chosen_clause.body_literals[literal_idx_two].args)))
+					random.shuffle(shuffled_arg_idxs_one)
+					random.shuffle(shuffled_arg_idxs_two)
+					for arg_idx_one in shuffled_arg_idxs_one:
+						for arg_idx_two in shuffled_arg_idxs_two:
+							if (literal_idx_one, arg_idx_one) != (literal_idx_two, arg_idx_two):
+								arg_type_one = chosen_clause.body_literals[literal_idx_one].relation.arg_types[arg_idx_one]
+								arg_type_two = chosen_clause.body_literals[literal_idx_two].relation.arg_types[arg_idx_two]
+								if arg_type_one == arg_type_two:
+									arg_one = chosen_clause.body_literals[literal_idx_one].args[arg_idx_one]
+									arg_two = chosen_clause.body_literals[literal_idx_two].args[arg_idx_two]
+
+									if arg_one != arg_two:
+										chosen_clause.body_literals[literal_idx_one].args[arg_idx_one] = arg_two
+										chosen_clause.body_literals[literal_idx_two].args[arg_idx_two] = arg_one
+
+										return True
+		assert self.is_type_valid()
+
+	def mutation_recurse(self): # choose a random literal and make it recurse on itself, with orig clause as base case
+		self.mutation_log.append("RECURSE")
+
+		assert self.is_type_valid()
+
+		clause_ids = list(self.clauses).copy()
+		random.shuffle(clause_ids)
+		for clause_id in clause_ids:
+			chosen_clause = self.clauses[clause_id]
+			literal_idxs = list(range(0, len(chosen_clause.body_literals)))
+			random.shuffle(literal_idxs)
+			for chosen_literal_idx in literal_idxs:
+				replaced_relation = chosen_clause.body_literals[chosen_literal_idx].relation
+
+				if len(replaced_relation.arg_types) >= 2:
+					possible_recurse_idxs = list()
+					for i, arg_type_one in enumerate(replaced_relation.arg_types):
+						for j, arg_type_two in enumerate(replaced_relation.arg_types):
+							if i != j:
+								if arg_type_one == arg_type_two:
+									possible_recurse_idxs.append((i, j))
+
+					if len(possible_recurse_idxs) != 0:
+						(recurse_idx_one, recurse_idx_two) = random.choice(possible_recurse_idxs)
+
+						# create new inv relation
+						inv_relation = Relation("inv" + str(self.inv_pred_num), "INVENTED PREDICATE", replaced_relation.arg_types)
+						self.inv_pred_num += 1
+						self.head_relations.append(inv_relation)
+
+						# create BASE CASE clause
+						base_case_body_literal_args = [("x" + str(arg_id)) for arg_id in range(0, len(inv_relation.arg_types))]
+						base_case_body_literal = Literal(replaced_relation, base_case_body_literal_args)
+
+						base_case_head_literal_args = [("x" + str(arg_id)) for arg_id in range(0, len(inv_relation.arg_types))]
+						base_case_head_literal = Literal(inv_relation, base_case_head_literal_args)
+
+						base_case_clause = Clause(base_case_head_literal, [base_case_body_literal], self.DNA)
+						self.clauses[base_case_clause.id] = base_case_clause
+
+						# create RECURSIVE clause
+						recursive_head_literal_args = [("x" + str(arg_id)) for arg_id in range(0, len(inv_relation.arg_types))]
+						recursive_head_literal = Literal(inv_relation, base_case_head_literal_args)
+
+						recursive_body_literal_args = [("x" + str(arg_id)) for arg_id in range(0, len(inv_relation.arg_types))]
+						recursive_body_literal_args[recurse_idx_two] = "x" + str(len(inv_relation.arg_types))
+						recursive_body_literal = Literal(inv_relation, recursive_body_literal_args)
+
+						recursive_body_literal_replaced_args = [("x" + str(arg_id)) for arg_id in range(0, len(inv_relation.arg_types))]
+						recursive_body_literal_replaced_args[recurse_idx_one] = "x" + str(len(inv_relation.arg_types))
+						recursive_body_literal_replaced = Literal(replaced_relation, recursive_body_literal_replaced_args)
+
+						recursive_clause = Clause(recursive_head_literal, [recursive_body_literal, recursive_body_literal_replaced], self.DNA)
+						self.clauses[recursive_clause.id] = recursive_clause
+
+						# replace chosen literal with new inv
+						replaced_args = copy.deepcopy(chosen_clause.body_literals[chosen_literal_idx].args)
+						chosen_clause.body_literals[chosen_literal_idx] = Literal(inv_relation, replaced_args)
+
+						assert self.is_type_valid()
+						return True
+		
+		assert self.is_type_valid()
+
+	def mutation_create_inv(self):
+		self.mutation_log.append("INVENT")
+
+		assert self.is_type_valid()
+
+		key, chosen_clause = random.choice(list(self.clauses.items()))
+		chosen_literal_idx = random.randint(0, len(chosen_clause.body_literals)-1)
+		replaced_relation = chosen_clause.body_literals[chosen_literal_idx].relation
+		replaced_literal = chosen_clause.body_literals[chosen_literal_idx]
+
+		# create new inv relation
+		inv_relation = Relation("inv" + str(self.inv_pred_num), "INVENTED PREDICATE", replaced_relation.arg_types)
+		self.inv_pred_num += 1
+		self.head_relations.append(inv_relation)
+
+		# create head and body inv literal
+		new_body_literal = Literal(inv_relation, chosen_clause.body_literals[chosen_literal_idx].args)
+
+		new_head_literal_args = [("x" + str(arg_id)) for arg_id in range(0, len(inv_relation.arg_types))]
+		new_head_literal = Literal(inv_relation, new_head_literal_args)
+
+		# create body literal for new inv
+		new_replaced_body_literal = copy.deepcopy(replaced_literal)
+		new_replaced_body_literal.id = "L" + get_new_id()
+		new_replaced_body_literal_args = [("x" + str(arg_id)) for arg_id in range(0, len(replaced_relation.arg_types))]
+		new_replaced_body_literal.args = new_replaced_body_literal_args
+		# replace replaced_literal with inv
+		chosen_clause.body_literals[chosen_literal_idx] = new_body_literal
+
+		# add inv :- replaced_literal to program
+		# new_head_literal :- new_replaced_body_literal
+		new_clause = Clause(new_head_literal, [new_replaced_body_literal], self.DNA)
+		self.clauses[new_clause.id] = new_clause
+
+		assert self.is_type_valid()
+
+
+	def optimization_reduce_inv_once(self): # replace the head of any invented predicate with one body literal with the body literal
+		old_relation = None
+		invented_body = None
+
+		assert self.is_type_valid()
+		assert self.is_grounded()
+
+		#def replace_one_head(self):
+		# find invented predicate to replace
+		relation_count = dict()
+		for clause in self.clauses:
+			head_relation_name = self.clauses[clause].head_literal.relation.name
+			if not head_relation_name in relation_count:
+				relation_count[head_relation_name] = 1
+			else:
+				relation_count[head_relation_name] += 1
+
+		shuffled_clause_ids = list(self.clauses).copy()
+		random.shuffle(shuffled_clause_ids)
+		for clause in shuffled_clause_ids:
+			head_relation_name = self.clauses[clause].head_literal.relation.name
+			if relation_count[head_relation_name] == 1:
+				if self.clauses[clause].head_literal.relation.relation_type == "INVENTED PREDICATE":
+					inv_appears_in_body = False
+					for body_literal in self.clauses[clause].body_literals:
+						if body_literal.relation.name == self.clauses[clause].head_literal.relation.name:
+							inv_appears_in_body = True
+							break
+					if not inv_appears_in_body: # only can replace non-recursive invented predicate clauses
+						old_relation = self.clauses[clause].head_literal.relation
+						invented_body = copy.deepcopy(self.clauses[clause].body_literals)
+						self.clauses.pop(clause)
+						break
+
+		if old_relation == None:
+			assert self.is_type_valid()
+			assert self.is_grounded()
+			return False
+
+		for clause in self.clauses:
+			old_literal_idx = 0
+			while old_literal_idx < len(self.clauses[clause].body_literals):
+				if self.clauses[clause].body_literals[old_literal_idx].relation.name == old_relation.name:
+					lowest_unseen_arg = self.clauses[clause].max_arg_id() + 1
+					inv_args = self.clauses[clause].body_literals[old_literal_idx].args
+
+					arg_mapping = dict()
+					for idx, arg in enumerate(inv_args):
+						arg_mapping[("x" + str(idx))] = arg
+					for curr_literal in invented_body:
+						for arg in curr_literal.args:
+							if not arg in arg_mapping:
+								arg_mapping[arg] = "x" + str(lowest_unseen_arg)
+								lowest_unseen_arg += 1
+
+					literals_to_add = copy.deepcopy(invented_body)
+					for curr_literal in literals_to_add:
+						for idx, arg in enumerate(curr_literal.args):
+							curr_literal.args[idx] = arg_mapping[arg]
+
+					self.clauses[clause].body_literals.pop(old_literal_idx)
+					self.clauses[clause].body_literals = self.clauses[clause].body_literals[:old_literal_idx] + literals_to_add + self.clauses[clause].body_literals[old_literal_idx:]
+				old_literal_idx += 1
+		assert self.is_type_valid()
+		assert self.is_grounded()
+		return True
+
+		#def replace_one_body(self):
+		#	body_relation_count = dict()
+		#	for clause in self.clauses:
+		#		for literal in self.clauses[clause].body_literals:
+		#			relation_name = literal.relation.name
+		#			if not head_relation_name in body_relation_count:
+		#				body_relation_count[head_relation_name] = 1
+		#			else:
+		#				body_relation_count[head_relation_name] += 1
+
+		#if random.random() < 0.5:
+		#	return replace_one_body(self) or replace_one_head(self)
+		#else:
+		#	return replace_one_head(self) or replace_one_body(self)
+			
+
+	def optimization_minimize_num_clauses_once(self, cache): # removes a random clause from the program
+		assert self.is_type_valid()
+		assert self.is_grounded()
+
+		if len(self.clauses) == 0:
+			return False
+
+		shuffled_clause_ids = list(self.clauses).copy()
+		random.shuffle(shuffled_clause_ids)
+		for clause_id in shuffled_clause_ids:
+			temp_program = copy.deepcopy(self)
+			temp_program.clauses.pop(clause_id)
+			if not temp_program.datalog_program() in cache:
+				self.clauses.pop(clause_id)
+				assert self.is_type_valid()
+				assert self.is_grounded()
+				return True
+		assert self.is_type_valid()
+		assert self.is_grounded()
+		return False
+
+	def optimization_minimize_num_args_once(self, cache): # sets two args equal, throughout the entire program (but only one pair)
+		assert self.is_type_valid()
+		assert self.is_grounded()
+
+		shuffled_clause_ids = list(self.clauses).copy()
+		random.shuffle(shuffled_clause_ids)
+		for clause_id in shuffled_clause_ids:
+			args_in_clause = set()
+			type_mapping = dict()
+			for idx, arg in enumerate(self.clauses[clause_id].head_literal.args):
+				args_in_clause.add(arg)
+				type_mapping[arg] = self.clauses[clause_id].head_literal.relation.arg_types[idx]
+			for body_literal in self.clauses[clause_id].body_literals:
+				for idx, arg in enumerate(body_literal.args):
+					args_in_clause.add(arg)
+					type_mapping[arg] = body_literal.relation.arg_types[idx]
+
+			args_in_clause_shuffled_one = copy.deepcopy(list(args_in_clause))
+			args_in_clause_shuffled_two = copy.deepcopy(list(args_in_clause))
+			random.shuffle(args_in_clause_shuffled_one)
+			random.shuffle(args_in_clause_shuffled_two)
+			for arg_one in args_in_clause_shuffled_one:
+				for arg_two in args_in_clause_shuffled_two:
+					if type_mapping[arg_one] == type_mapping[arg_two]:
+						max_head_arg = len(self.clauses[clause_id].head_literal.args) - 1
+						if arg_one != arg_two and (int(arg_one[1:]) > max_head_arg or int(arg_two[1:]) > max_head_arg):
+							target_arg = "x" + str(min(int(arg_one[1:]), int(arg_two[1:])))
+							temp_program = copy.deepcopy(self)
+							for curr_literal in temp_program.clauses[clause_id].body_literals:
+									for idx, arg in enumerate(curr_literal.args):
+										if arg == arg_one or arg == arg_two:
+											curr_literal.args[idx] = target_arg
+							if not temp_program.datalog_program() in cache:
+								for curr_literal in self.clauses[clause_id].body_literals:
+										for idx, arg in enumerate(curr_literal.args):
+											if arg == arg_one or arg == arg_two:
+												curr_literal.args[idx] = target_arg
+								assert self.is_type_valid()
+								assert self.is_grounded()
+								return True
+		assert self.is_type_valid()
+		assert self.is_grounded()
+		return False
+
+	def optimization_remove_repeats_once(self): # removes a repeat clause or repeat literal randomly, once
+		assert self.is_type_valid()
+		assert self.is_grounded()
+
+		def remove_repeats_clause(self):
+			shuffled_clause_ids_one = list(self.clauses).copy()
+			shuffled_clause_ids_two = list(self.clauses).copy()
+			random.shuffle(shuffled_clause_ids_one)
+			random.shuffle(shuffled_clause_ids_two)
+			for clause_id_one in shuffled_clause_ids_one:
+				for clause_id_two in shuffled_clause_ids_two:
+					if clause_id_one != clause_id_two:
+						if self.clauses[clause_id_one].head_literal.relation.name == self.clauses[clause_id_two].head_literal.relation.name:
+							set_literals_one = set()
+							set_literals_two = set()
+							for literal in self.clauses[clause_id_one].body_literals:
+								set_literals_one.add(literal)
+							for literal in self.clauses[clause_id_two].body_literals:
+								set_literals_two.add(literal)
+							if set_literals_one == set_literals_two:
+								self.clauses.pop(clause_id_one)
+								assert self.is_type_valid()
+								assert self.is_grounded()
+								return True
+			assert self.is_type_valid()
+			assert self.is_grounded()
+			return False
+
+		def remove_repeats_literal(self):
+			for clause_id in self.clauses:
+				shuffled_literal_tuples_one = list(enumerate(self.clauses[clause_id].body_literals))
+				shuffled_literal_tuples_two = list(enumerate(self.clauses[clause_id].body_literals))
+
+				random.shuffle(shuffled_literal_tuples_one)
+				random.shuffle(shuffled_literal_tuples_two)
+				for literal_one_idx, literal_one in shuffled_literal_tuples_one:
+					for literal_two_idx, literal_two in shuffled_literal_tuples_two:
+						if literal_one_idx != literal_two_idx:
+							if literal_one.relation.name == literal_two.relation.name:
+								if literal_one.args == literal_two.args:
+									self.clauses[clause_id].body_literals.pop(literal_two_idx)
+									assert self.is_type_valid()
+									assert self.is_grounded()
+									return True
+			assert self.is_type_valid()
+			assert self.is_grounded()
+			return False
+
+		if random.random() < 0.5:
+			return remove_repeats_clause(self) or remove_repeats_literal(self)
+		else:
+			return remove_repeats_literal(self) or remove_repeats_clause(self)
+			
+
+	def optimization_minimize_num_literals_once(self, cache): # remove a random literal, once (but only if there are at least two literals in a clause)
+		assert self.is_type_valid()
+		assert self.is_grounded()
+
+		if len(self.clauses) == 0:
+			assert self.is_type_valid()
+			assert self.is_grounded()
+			return False
+		shuffled_clause_ids = list(self.clauses).copy()
+		random.shuffle(shuffled_clause_ids)
+
+		for clause_id in shuffled_clause_ids:
+			if len(self.clauses[clause_id].body_literals) >= 2:
+				shuffled_literal_ids = list(range(0, len(self.clauses[clause_id].body_literals)))
+				random.shuffle(shuffled_literal_ids)
+				for literal_id in shuffled_literal_ids:
+					temp_program = copy.deepcopy(self)
+					temp_program.clauses[clause_id].body_literals.pop(literal_id)
+					if temp_program.is_grounded() and (not temp_program.datalog_program() in cache):
+						self.clauses[clause_id].body_literals.pop(literal_id)
+					
+						assert self.is_type_valid()
+						assert self.is_grounded()
+						return True
+		assert self.is_type_valid()
+		assert self.is_grounded()
+		return False
+
+	def run(self): #updates fitness, num_undesired_but_produced, num_desired_but_unproduced
+		souffle_run_start_time = time.time()
+		runtime_statistics["souffle_calls"] += 1
+
+		global calls_souffle
+		global use_undesired
+
+		f = open((benchmarks_directory + '/' + str(self.subprocess_id) + '/' + benchmark_name + '/temp_program.dl'), "w")
+		f.write(self.datalog_program())
+		f.close()
+
+		f = open((benchmarks_directory + '/' + str(self.subprocess_id) + '/' + benchmark_name + '/Rule.facts'), "w")
+		f.write(self.datalog_rule_facts())
+		f.close()
+
+		souffle_proc = subprocess.Popen([ SOUFFLE_PATH, benchmarks_directory + '/' + str(self.subprocess_id) + '/' + benchmark_name + '/temp_program.dl', '-F', (benchmarks_directory + '/' + str(self.subprocess_id) + '/' + benchmark_name), '-D', (benchmarks_directory + '/' + str(self.subprocess_id) + '/' + benchmark_name) ], \
+						  stdin=subprocess.PIPE, \
+						  stdout=subprocess.PIPE, \
+						  stderr=subprocess.PIPE, \
+						  universal_newlines=True)
+		souffle_proc.wait()
+
+		calls_souffle += 1
+
+		rel_produced = loadRelation(benchmarks_directory + '/' + str(self.subprocess_id) + '/' + benchmark_name + '/' + self.output_relation.name + '.csv')
+		rel_expected = loadRelation(benchmarks_directory + '/' + str(self.subprocess_id) + '/' + benchmark_name + '/' + self.output_relation.name + '.expected')	
+		self.num_correct = len(rel_produced.intersection(rel_expected))
+		
+		undesired_but_produced = list(rel_produced - rel_expected)
+		desired_but_unproduced = list(rel_expected - rel_produced)
+		# if use_undesired == "1":
+		if use_undesired:
+			rel_undesired = loadRelation(benchmarks_directory + '/' + str(self.subprocess_id) + '/' + benchmark_name + '/' + self.output_relation.name + '.undesired')
+			undesired_but_produced = rel_undesired.intersection(rel_produced)
+
+		self.num_undesired_but_produced = len(undesired_but_produced)
+		self.num_desired_but_unproduced = len(desired_but_unproduced)
+		self.fitness = fScore(self.num_correct, self.num_undesired_but_produced, self.num_desired_but_unproduced, self.DNA["BETA"])
+		self.f1 = fScore(self.num_correct, self.num_undesired_but_produced, self.num_desired_but_unproduced, 1)
+
+		runtime_statistics["souffle_time"] += time.time() - souffle_run_start_time
+
+		total_program_size = 0
+		for clause in self.clauses:
+			total_program_size += len(self.clauses[clause].body_literals)
+		self.size = total_program_size
+
+class Population:
+	def __init__(self, population_size, input_relations, output_relation, subprocess_id, seed_program=None):
+		self.starter_program = copy.deepcopy(seed_program)
+		self.subprocess_id = subprocess_id
+		beta = 1 + random.random()*9
+		if random.random() < 0.5:
+			beta = 1.0 / beta
+		self.DNA = {"MAX_REDUCTIONS_PER_GENERATION": 1, "PROB_REDUCTION": 1.0, "REDUCTION_PROPORTION_OF_SURVIVORS": 0.2, "LITERALS_PER_SEED_PROGRAM": 1, "CLAUSES_PER_SEED_PROGRAM": 1, "MAX_LITERALS_PER_LINEAR_CLAUSE": 3, "PROPORTION_OF_SURVIVORS": 0.2, "MAX_MUTATIONS_PER_GENERATION": int(3 + random.random()*random.random()*15), "BETA": beta, "PROB_MUTATION_APPEND": 0.4, "PROB_MUTATION_EXTEND_CLAUSE": 0.3, "PROB_MUTATION_SWAP": 0.2, "PROB_MUTATION_CREATE_INV": 0.05, "PROB_MUTATION_RECURSE": 0.05, "PROB_MUTATION": 0.3}
+		
+		#ensures that sum of probabilities of 5 types of mutation is 1. self.DNA.PROB_MUTATION is probability that a mutation is applied at any given moment
+		total = self.DNA["PROB_MUTATION_APPEND"] + self.DNA["PROB_MUTATION_EXTEND_CLAUSE"] + self.DNA["PROB_MUTATION_SWAP"] + self.DNA["PROB_MUTATION_CREATE_INV"] + self.DNA["PROB_MUTATION_RECURSE"]
+		self.DNA["PROB_MUTATION_APPEND"] /= total
+		self.DNA["PROB_MUTATION_EXTEND_CLAUSE"] /= total
+		self.DNA["PROB_MUTATION_SWAP"] /= total
+		self.DNA["PROB_MUTATION_CREATE_INV"] /= total
+		self.DNA["PROB_MUTATION_RECURSE"] /= total
+
+		self.cache = set() #cache stores all type-correct programs with insufficient fitness discovered during the reduction phase and is used to determine when no further reductions are possible
+
+		self.generation_number = 0
+		self.programs = list()
+		for i in range(0, population_size):
+			program = copy.deepcopy(seed_program)
+			if program == None:
+				program = Program(input_relations, output_relation, self.DNA)
+				program.create_seed_program()
+			program.subprocess_id = self.subprocess_id
+			for cl in program.clauses:
+				if len(program.clauses[cl].ungrounded_args()) != 0:
+					print(program.clauses[cl])
+					assert False
+
+			self.programs.append(program)
+		self.id = "POP" + get_new_id()
+
+	def __str__(self):
+		output_str = "\n\n"
+		output_str += "-- POPULATION " + str(self.id) + " --\n"
+		output_str += "SUBPROCESS ID: " + str(self.subprocess_id) + "\n"
+		output_str += "GENERATION: " + str(self.generation_number) + "\n"
+		output_str += "POPULATION SIZE: " + str(len(self.programs)) + "\n\n"
+		output_str += "CALLS TO SOUFFLE: " + str(calls_souffle) + "\n\n"
+		output_str += "FITTEST PROGRAM: " + str(self.programs[0]) + "\n"
+		output_str += "FITTEST PROGRAM HAS FITNESS: " + str(self.programs[0].fitness) + "\n"
+		output_str += "HAS WHY, WHYNOT: (" + str(self.programs[0].num_undesired_but_produced) + ", " + str(self.programs[0].num_desired_but_unproduced) + ")"
+		output_str += "\nHAS TRUE POS: (" + str(self.programs[0].num_correct) + ")"
+		output_str += "\nCACHE SIZE: " + str(len(self.cache)) + "\n"
+		return output_str
+
+	def compete(self):
+		for program in self.programs:
+			for cl in program.clauses:
+				if len(program.clauses[cl].ungrounded_args()) != 0:
+					print(program)
+					print("PROBLEM CLAUSE:\n")
+					print(program.clauses[cl])
+					print(program.clauses[cl].ungrounded_args())
+					assert False
+			assert program.is_type_valid() # all programs should be type-valid if setting is enabled
+			program.run()
+
+	def remove_weakest(self, stage):
+		if stage == "ACCRETION":
+			self.programs = sorted(self.programs, key=lambda program: -program.fitness)
+			self.programs = self.programs[:int(self.DNA["PROPORTION_OF_SURVIVORS"] * len(self.programs))]
+		else:
+			# select all programs that pass the fitness cutoff
+			target_num_programs = int(self.DNA["REDUCTION_PROPORTION_OF_SURVIVORS"] * len(self.programs))
+			sorted_programs = sorted(self.programs, key=lambda program: -program.fitness)
+			self.programs = list()
+			for program in sorted_programs:
+				#print(program)
+				#print(program.fitness)
+				if program.fitness >= OPTIMIZATION_TARGET:
+					self.programs.append(program)
+				self.cache.add(program.datalog_program())
+
+			# select the smallest target_num_programs programs
+			self.programs = sorted(self.programs, key=lambda program: program.size)
+			self.programs = self.programs[:target_num_programs]
+
+
+	def generate_offspring_accretion(self):
+		global ACCRETION_POPULATION_SIZE
+
+		self.generation_number += 1
+
+		new_programs = list()
+		for program in self.programs:
+			for i in range(0, int(1 / self.DNA["PROPORTION_OF_SURVIVORS"])+1):
+				if (len(new_programs) + len(self.programs)) < ACCRETION_POPULATION_SIZE:
+					child_program = copy.deepcopy(program)
+					child_program.id = "P" + get_new_id()
+
+					mutating_start_time = time.time()
+
+					runtime_statistics["mutating_calls"] += 1
+					runtime_statistics["mutating_num_loops"] += 1
+
+					child_program = copy.deepcopy(program)
+					curr_num_mutations = 0
+					for k in range(self.DNA["MAX_MUTATIONS_PER_GENERATION"]):
+						if random.random() < self.DNA["PROB_MUTATION"]:
+							curr_num_mutations += 1
+
+					for k in range(curr_num_mutations):
+						random_prob = random.random()
+
+						random_prob -= self.DNA["PROB_MUTATION_APPEND"]
+						if random_prob < 0:
+							child_program.mutation_append()
+						else:
+							random_prob -= self.DNA["PROB_MUTATION_SWAP"]
+							if random_prob < 0:
+								child_program.mutation_swap()
+							else:
+								random_prob -= self.DNA["PROB_MUTATION_EXTEND_CLAUSE"]
+								if random_prob < 0:
+									child_program.mutation_extend_clause()
+								else:
+									random_prob -= self.DNA["PROB_MUTATION_CREATE_INV"]
+									if random_prob < 0:
+										child_program.mutation_create_inv()
+									else:
+										child_program.mutation_recurse()
+						
+					assert child_program.is_grounded()
+					assert child_program.is_type_valid()
+					new_programs.append(child_program)
+
+					runtime_statistics["mutating_time"] += time.time() - mutating_start_time
+
+		self.programs = self.programs + new_programs
+
+	def generate_offspring_reduction(self):
+		global REDUCTION_POPULATION_SIZE
+
+		self.generation_number += 1
+
+		new_programs = list()
+		for program in self.programs:
+			for i in range(0, int(1 / self.DNA["REDUCTION_PROPORTION_OF_SURVIVORS"])+1):
+				if (len(new_programs) + len(self.programs)) < REDUCTION_POPULATION_SIZE:
+					mutating_start_time = time.time()
+
+					runtime_statistics["reduction_calls"] += 1
+					runtime_statistics["reduction_num_loops"] += 1
+
+					child_program = copy.deepcopy(program)
+					curr_num_mutations = 1
+					for k in range(self.DNA["MAX_REDUCTIONS_PER_GENERATION"]-1):
+						if random.random() < self.DNA["PROB_REDUCTION"]:
+							curr_num_mutations += 1
+
+					applied_mutation = False
+					for k in range(curr_num_mutations):
+						#print("REDUCING")
+						available_reductions = ["rr", "ri", "mc", "ml", "ma"]
+						while True:
+							if len(available_reductions) == 0:
+								break
+							curr_reduction = random.choice(available_reductions)
+							#print("CHOSE " + curr_reduction)
+							if curr_reduction == "rr":
+								if not child_program.optimization_remove_repeats_once():
+									available_reductions.remove("rr")
+								else:
+									applied_mutation = True
+									break
+							elif curr_reduction == "ri":
+								if not child_program.optimization_reduce_inv_once():
+									available_reductions.remove("ri")
+								else:
+									applied_mutation = True
+									break
+							elif curr_reduction == "mc":
+								if not child_program.optimization_minimize_num_clauses_once(self.cache):
+									available_reductions.remove("mc")
+								else:
+									applied_mutation = True
+									break
+							elif curr_reduction == "ml":
+								if not child_program.optimization_minimize_num_literals_once(self.cache):
+									available_reductions.remove("ml")
+								else:
+									applied_mutation = True
+									break
+							elif curr_reduction == "ma":
+								if not child_program.optimization_minimize_num_args_once(self.cache):
+									available_reductions.remove("ma")
+								else:
+									applied_mutation = True
+									break
+
+					assert child_program.is_grounded()
+					assert child_program.is_type_valid()
+					if applied_mutation:
+						new_programs.append(child_program)
+					runtime_statistics["time_reduction"] += time.time() - mutating_start_time
+		#print("LEN NEW PRGORAMS: " + str(len(new_programs)))
+		if len(new_programs) == 0:
+			return False
+		self.programs = self.programs + new_programs
+		return True
+
+### GLOBAL VARS ###
+type_signatures = set()
+relations = list()
+input_relations = list()
+output_relations = list()
+
+### STATS ###
+calls_souffle = 0
+gensynth_start_time = time.time()
+
+### LOAD IN SIGNATURES ###
+self_path = sys.argv[0]
+benchmarks_directory = cmd_args.benchmark_dir # sys.argv[1]
+benchmark_name = cmd_args.benchmark_name # sys.argv[2]
+trial_num = cmd_args.log_number # int(sys.argv[4])
+use_undesired = cmd_args.use_neg # sys.argv[5]
+
+with open(benchmarks_directory + '/0/' + benchmark_name + '/rules.t') as fin:
+	for line in fin:
+		if line == '':
+			break
+
+		relation_name = line[:line.index('(')]
+		relation_type = "OUTPUT"
+		if relation_name[0] == '*':
+			relation_name = relation_name[1:]
+			relation_type = "INPUT"
+
+		line = line[line.index('(')+1:line.index(')')]
+		relation_arg_types = list()
+		for arg_type in line.split(','):
+			san_type = arg_type.replace(" ", "")
+			type_signatures.add(san_type)
+			relation_arg_types.append(san_type)
+		
+		relation = Relation(relation_name, relation_type, relation_arg_types)
+		relations.append(relation)
+		if relation_type == "INPUT":
+			input_relations.append(relation)
+		else:
+			output_relations.append(relation)
+
+# preparing directories for multiple populations
+print("Preparing directories for the benchmark")
+cmd_mkdirs = "mkdir -p " + " ".join([benchmarks_directory + "/" + str(x) for x in range(1, NUM_POPULATIONS)])
+cmd_rmdirs = "rm -rf " + " ".join([benchmarks_directory + "/" + str(x) for x in range(1, NUM_POPULATIONS)])
+os.system(cmd_mkdirs)
+for d in range(1, NUM_POPULATIONS):
+	cmd_cpdir = "cp -r " + benchmarks_directory + "/0/" + benchmark_name + " " + benchmarks_directory + "/" + str(d) + "/"
+	os.system(cmd_cpdir)
+
+print("Benchmark prepared")
+
+def save_statistics():
+	d = benchmarks_directory + "/logs/trial" + str(trial_num) + "/"
+	if not os.path.exists(d):
+		os.makedirs(d)
+	myf = open(benchmarks_directory + "/logs/trial" + str(trial_num) + "/" + benchmark_name + "-parallel_log" + str(VERSION_NUMBER) + ".txt", "w")
+	myf.write(json.dumps(runtime_statistics))
+	myf.close()
+
+def save_population(population, subprocess_id):
+	d = benchmarks_directory + "/logs/trial" + str(trial_num) + "/"
+	if not os.path.exists(d):
+		os.makedirs(d)
+	myf = open(benchmarks_directory + "/logs/trial" + str(trial_num) + "/" + benchmark_name + "-parallel_log_detailed" + str(VERSION_NUMBER) + ".txt", "a+")
+	myf.write(str(population))
+	myf.close()
+
+def save_final_program(program, subprocess_id):
+	d = benchmarks_directory + "/logs/trial" + str(trial_num) + "/"
+	if not os.path.exists(d):
+		os.makedirs(d)
+	myf = open(benchmarks_directory + "/logs/trial" + str(trial_num) + "/" + benchmark_name + "-parallel_log_final" + str(VERSION_NUMBER) + ".txt", "a+")
+	myf.write(str(program))
+	myf.close()
+
+
+final_acc_program = None
+final_acc_subprocess_id = -1
+final_acc_generations_to_completion = -1
+def run_accretion(population, subprocess_id):
+	global final_acc_program
+	global final_acc_subprocess_id
+
+	population.subprocess_id = subprocess_id
+	for i in range(0, GENERATION_LIMIT):
+		#save_statistics(subprocess_id)
+		# print("\n\n\n--- POPULATION OVERVIEWS | GENERATION " + str(i) + " ---")
+		population.compete()
+		population.remove_weakest("ACCRETION")
+		save_population(population, subprocess_id)
+		print(population)
+		if population.programs[0].f1 >= TARGET_SCORE:
+			print("CLOSING POOL BASED ON SUBPROCESS: " + str(subprocess_id))
+			return (population.programs[0], subprocess_id, i)
+		population.generate_offspring_accretion()
+
+final_red_programs = list()
+final_red_subprocess_ids = list()
+final_red_generations_to_completions = list()
+def run_reduction(population, subprocess_id):
+	global final_red_program
+	global final_red_subprocess_id
+
+	population.subprocess_id = subprocess_id
+	for i in range(0, GENERATION_LIMIT):
+		#save_statistics(subprocess_id)
+		print("\n\n\n--- POPULATION OVERVIEWS | GENERATION " + str(i) + " ---")
+		print(population)
+		population.compete()
+		population.remove_weakest("REDUCTION")
+		save_population(population, subprocess_id)
+		#print(population)
+		if not population.generate_offspring_reduction(): # no child programs could be generated
+			print("CLOSING POOL BASED ON SUBPROCESS: " + str(subprocess_id))
+			#print(population)
+			return (population.programs[0], subprocess_id, i)
+
+def stall_process():
+	time.sleep(TIMEOUT)
+	return (None, 100, -1)
+
+pool = None
+def halt_acc_algorithm(r):
+	global final_acc_program
+	global final_acc_subprocess_id
+	global final_acc_generations_to_completion
+
+	print("CALLBACK CALLED!")
+	final_acc_program = r[0]
+	final_acc_subprocess_id = r[1]
+	final_acc_generations_to_completion = r[2]
+	pool.terminate()
+
+def halt_red_algorithm(r):
+	global final_red_programs
+	global final_red_subprocess_ids
+	global final_red_generations_to_completions
+
+	print("CALLBACK CALLED!")
+	final_red_programs.append(r[0])
+	final_red_subprocess_ids.append(r[1])
+	final_red_generations_to_completions.append(r[2])
+
+if __name__ == "__main__":
+	for output_relation in output_relations: # run genetic alg for each output relation independently
+		
+		start_time = time.time()
+
+		populations = list()
+		for i in range(0, NUM_POPULATIONS):
+			populations.append(Population(ACCRETION_POPULATION_SIZE, input_relations, output_relation, i))
+
+		accretion_start_time = time.time()
+		pool = multiprocessing.Pool(multiprocessing.cpu_count())
+		for idx in range(len(populations)):
+			print("starting subproc: " + str(idx))
+			pool.apply_async(run_accretion, args=(populations[idx], idx), callback=(halt_acc_algorithm))
+			#run_accretion(populations[idx], idx)
+		pool.apply_async(stall_process, args=(), callback=(halt_acc_algorithm))
+		pool.close()
+		pool.join()
+
+		runtime_statistics["time_accretion"] = time.time() - accretion_start_time
+
+		if final_acc_program != None:
+			print("\n\n\n\n\n---------------final_acc_program:-----------------")
+			print(final_acc_program)
+			print("FINAL ACC SUPROC ID: " + str(final_acc_subprocess_id))
+
+			save_final_program(final_acc_program, final_acc_subprocess_id)
+			total_num_literals = 0
+			max_num_literals = 0
+			for curr_cl_key in final_acc_program.clauses:
+					curr_cl = final_acc_program.clauses[curr_cl_key]
+					total_num_literals += len(curr_cl.body_literals)
+					max_num_literals = max(max_num_literals, len(curr_cl.body_literals))
+			runtime_statistics["solution_total_num_literals"] = total_num_literals
+			runtime_statistics["solution_max_num_literals"] = max_num_literals
+			runtime_statistics["solution_num_clauses"] = len(final_acc_program.clauses)
+
+			reduction_start_time = time.time()
+
+			populations = list()
+			for i in range(0, NUM_POPULATIONS):
+				populations.append(Population(REDUCTION_POPULATION_SIZE, input_relations, output_relation, i, final_acc_program))
+
+			pool = multiprocessing.Pool(multiprocessing.cpu_count())
+			for idx in range(len(populations)):
+				print("starting subproc: " + str(idx))
+				pool.apply_async(run_reduction, args=(populations[idx], idx), callback=(halt_red_algorithm))
+				#run_reduction(populations[idx], idx)
+			#pool.apply_async(stall_process, args=(), callback=(halt_red_algorithm))
+			pool.close()
+			pool.join()
+
+			runtime_statistics["time_reduction"] = time.time() - reduction_start_time
+
+
+			if len(final_red_programs) != 0:
+				min_size = 1000000
+				final_red_subprocess_id = -1
+				final_red_generations_to_completion = -1
+				final_red_program = None
+				for idx, program in enumerate(final_red_programs):
+					if program.size < min_size:
+						min_size = program.size
+						final_red_subprocess_id = final_red_subprocess_ids[idx]
+						final_red_generations_to_completion = final_red_generations_to_completions[idx]
+						final_red_program = program
+				save_final_program(final_red_program, final_red_subprocess_id)
+				total_num_literals = 0
+				max_num_literals = 0
+				for curr_cl_key in final_red_program.clauses:
+					curr_cl = final_red_program.clauses[curr_cl_key]
+					total_num_literals += len(curr_cl.body_literals)
+					max_num_literals = max(max_num_literals, len(curr_cl.body_literals))
+				runtime_statistics["opt_solution_total_num_literals"] = total_num_literals
+				runtime_statistics["opt_solution_max_num_literals"] = max_num_literals
+				runtime_statistics["opt_solution_num_clauses"] = len(final_red_program.clauses)
+
+				runtime_statistics["generations_to_completion"] = final_red_generations_to_completion
+				runtime_statistics["solved"] = 1
+				runtime_statistics["solved_subprocess_id"] = final_red_subprocess_id
+				print("Cleaning up")
+				os.system(cmd_rmdirs)
+								
+		runtime_statistics["runtime"] = time.time() - start_time
+		save_statistics()

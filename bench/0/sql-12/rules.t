@@ -1,0 +1,6 @@
+*input1(supplier_key,part_id)
+*isRed(color)
+*isGreen(color)
+*input2(part_id,color)
+*input3(supplier_key,sname)
+ans(sname)

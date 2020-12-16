@@ -1,0 +1,5 @@
+*locatedInCR_S2(C, R)
+*locatedInCS_S2(C, S)
+*locatedInSR_S2(S, R)
+*neighborOf_S2(C, C)
+locatedInRgn_tr_va(C, R)

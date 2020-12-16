@@ -1,0 +1,8 @@
+*points_initial(V,H)
+*store(V,F,V)
+*load(V,F,V)
+*invocation(C,H,C,M)
+*actual(H,Z,V)
+*formal(M,Z,V)
+*assign(C,V,C,V)
+heappointsto(H,F,H)
